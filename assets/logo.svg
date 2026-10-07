@@ -1,0 +1,23 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="128" height="128" viewBox="0 0 128 128">
+  <title>ArrangeOMatic</title>
+  <rect width="128" height="128" rx="28" fill="#15151c"/>
+  <rect x="1.5" y="1.5" width="125" height="125" rx="26.5" fill="none" stroke="#33333f" stroke-width="3"/>
+  <!-- 4x3 bag grid; empty slots -->
+  <rect x="16" y="28" width="21" height="21" rx="4" fill="#23232d"/>
+  <rect x="16" y="53" width="21" height="21" rx="4" fill="#23232d"/>
+  <rect x="16" y="78" width="21" height="21" rx="4" fill="#23232d"/>
+  <rect x="91" y="53" width="21" height="21" rx="4" fill="#23232d"/>
+  <rect x="91" y="78" width="21" height="21" rx="4" fill="#23232d"/>
+  <!-- pinned hearthstone -->
+  <rect x="41" y="28" width="21" height="21" rx="4" fill="#e2574b"/>
+  <path transform="translate(45.5,33) scale(0.5)" fill="#ffffff"
+        d="M12 21.35l-1.45-1.32C5.4 15.36 2 12.28 2 8.5 2 5.42 4.42 3 7.5 3c1.74 0 3.41.81 4.5 2.09C13.09 3.81 14.76 3 16.5 3 19.58 3 22 5.42 22 8.5c0 3.78-3.4 6.86-8.55 11.54L12 21.35z"/>
+  <!-- single items grouped by category -->
+  <rect x="66" y="28" width="21" height="21" rx="4" fill="#46c2b0"/>
+  <rect x="91" y="28" width="21" height="21" rx="4" fill="#46c2b0"/>
+  <!-- one cluster of same-item stacks -->
+  <rect x="41" y="53" width="21" height="21" rx="4" fill="#f0a63a"/>
+  <rect x="66" y="53" width="21" height="21" rx="4" fill="#f0a63a"/>
+  <rect x="41" y="78" width="21" height="21" rx="4" fill="#f0a63a"/>
+  <rect x="66" y="78" width="21" height="21" rx="4" fill="#f0a63a"/>
+</svg>
