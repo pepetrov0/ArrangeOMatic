@@ -4,7 +4,10 @@ ArrangeOMatic - WotLK 3.3.5a
   /aom                  arrange your bags
   /aom bank             arrange the character bank (bank must be open)
   /aom gbank            arrange the currently open guild bank tab
-  /aom columns <n>      set the number of grid columns (saved)
+  /aom ui default       you use the default Blizzard UI: one window per bag  (default)
+  /aom ui single        you use ONE combined bag window (a bag addon)
+  /aom ui               show the current setting
+  /aom columns <n>      set the number of grid columns (saved; "ui single" only)
   /aom columns          show the current value
   /aom groups subtype   group single items by type AND subtype (default)
   /aom groups type      group single items by broad type only
@@ -18,14 +21,32 @@ Model
       bank   - the 28 main bank slots, then the 7 bank bags
       gbank  - the 98 slots of the active guild bank tab
     Specialised bags (quivers, herb bags, ...) and the keyring are left alone.
-  * That list is shown as a grid with N columns the way bag windows draw it:
-    slot 1 is the bottom-right cell, slots run right-to-left and rows stack
-    upwards. If S is not a multiple of N, the TOP row is the short one and is
-    aligned to the right. The last slot is therefore the left end of the top
+  * "ui single" (one combined bag window, for single-bag addons):
+    that list is shown as ONE grid with N columns the way single-bag addons
+    draw it: slot 1 is the bottom-right cell, slots run right-to-left and rows
+    stack upwards. If S is not a multiple of N, the TOP row is the short one and
+    is aligned to the right. The last slot is therefore the left end of the top
     row, and that is where packing starts: items are packed from the last slot
     towards the first, so free space ends up at the bottom/front.
-  * When sorting your bags the Hearthstone is always pinned to the last slot of
-    all bags (the first cell of the top row).
+  * "ui default" (default Blizzard UI, one window per bag; the default setting):
+    every bag is its OWN grid, so a block can never straddle two windows.
+      - bags: 4 columns (NUM_CONTAINER_COLUMNS). Blizzard draws the LAST slot at
+        the bottom-right and slot 1 at the top-left of a short, right-aligned
+        top row, i.e. slots read left-to-right, top-to-bottom - the opposite way
+        round to the single window above.
+      - main bank: 7 columns x 4 rows, slot 1 top-left; the 7 bank bags are 4
+        columns like the inventory bags.
+    Clusters are first handed out to windows (largest first; a cluster too big
+    for any one window is split over several). For your bags the LAST bag is
+    filled first and the backpack last, so the free space ends up in the first
+    bags, where new loot lands. The bank works the same way. A cluster larger
+    than the largest bag (the main bank not counted) is always split over
+    several bags. Then each
+    window is laid out on its own exactly like the single grid, packing from the
+    top-left so free space ends up at the bottom of each window.
+  * When sorting your bags the Hearthstone is always pinned to the first cell of
+    the top row of the first window to be filled: the last slot of all bags in
+    single mode, the top-left of the LAST bag in default mode.
   * The guild bank window is 14 columns x 7 rows, numbered column by column, so
     for /aom gbank the grid "width" is fixed at 7 (one model row = one window
     column, drawn transposed, which keeps clusters square in the window). The
@@ -47,7 +68,15 @@ local GBANK_SLOTS     = MAX_GUILDBANK_SLOTS_PER_TAB or 98
 -- column: slots 1-7 are the first column top to bottom, 8-14 the second, etc.
 -- (NUM_SLOTS_PER_GUILDBANK_GROUP is 14, but that is a pair of columns.)
 local GBANK_COLUMN_H  = 7
-local HEARTHSTONE_ID  = 6948  -- always pinned to the last slot of all bags (bottom-right of the grid)
+local HEARTHSTONE_ID  = 6948  -- always pinned to the first cell of the top row of the first window
+
+-- Default Blizzard UI geometry (verified against the 3.3.5a FrameXML):
+--   ContainerFrame.lua: NUM_CONTAINER_COLUMNS = 4; button i (1 = bottom-right)
+--     gets slot ID size-i+1, so the last slot is bottom-right, slot 1 is the top
+--     left of the short, right-aligned top row.
+--   BankFrame.xml: BankFrameItem1 is top-left, 7 buttons per row, 28 slots.
+local CONTAINER_COLUMNS = NUM_CONTAINER_COLUMNS or 4
+local BANK_COLUMNS      = 7
 
 -- Layout tuning
 -- Penalty for empty cells inside a cluster's bounding box. The layout is tried
@@ -70,6 +99,12 @@ end
 
 local function GetColumns()
     return (ArrangeOMaticDB and ArrangeOMaticDB.columns) or DEFAULT_COLUMNS
+end
+
+-- "default" = default Blizzard UI, one window per bag  (the default setting)
+-- "single"  = one combined bag window (a bag addon)  - the original behaviour
+local function GetUI()
+    return (ArrangeOMaticDB and ArrangeOMaticDB.ui == "single") and "single" or "default"
 end
 
 ---------------------------------------------------------------------------
@@ -124,8 +159,10 @@ local function Describe(api, slot)
     }
 end
 
+-- Returns slots, items and groups. groups has one entry per bag that was
+-- included: { bag = id, first = index of its first slot in `slots`, size = n }.
 local function ScanBags(bagIds)
-    local slots, items = {}, {}
+    local slots, items, groups = {}, {}, {}
     for _, bag in ipairs(bagIds) do
         local n = GetContainerNumSlots(bag)
         if n and n > 0 then
@@ -135,6 +172,7 @@ local function ScanBags(bagIds)
                 general = (bagType == nil or bagType == 0)
             end
             if general then
+                groups[#groups + 1] = { bag = bag, first = #slots + 1, size = n }
                 for i = 1, n do
                     local v = #slots + 1
                     slots[v] = { bag = bag, slot = i }
@@ -143,7 +181,33 @@ local function ScanBags(bagIds)
             end
         end
     end
-    return slots, items
+    return slots, items, groups
+end
+
+-- Geometry of the windows the slot list is drawn in. A layout is a list of
+-- grids that partition slots 1..S:  { first, size, cols, flip, mirror }
+--   flip = true : the last slot is the top-left cell (single-window addons)
+--   flip = false: slot 1 is the top-left cell (default Blizzard UI)
+--   mirror = true: also try block shapes with their short row on top (see
+--                  ShapeOffsets); off by default so single-window results
+--                  stay exactly as they always were
+local function SingleWindowLayout(S, N)
+    return { { first = 1, size = S, cols = N, flip = true } }
+end
+
+local function SeparateWindowsLayout(groups, fillFromEnd)
+    -- fillFromEnd: hand clusters to the LAST bag first, so the free space ends up
+    -- in the first bags (backpack, bag 1...) - those are the ones new loot lands in.
+    -- (Used for bags and bank alike.)
+    local layout = { fillFromEnd = fillFromEnd }
+    for i, g in ipairs(groups) do
+        layout[i] = {
+            first = g.first, size = g.size, flip = false, mirror = true,
+            main  = (g.bag == BANK_CONTAINER),
+            cols  = (g.bag == BANK_CONTAINER) and BANK_COLUMNS or CONTAINER_COLUMNS,
+        }
+    end
+    return layout
 end
 
 local function InventoryBagIds()
@@ -214,11 +278,15 @@ local function BuildClusters(items, S, skip)
     return clusters
 end
 
--- Cells of a w x h block holding k items: full rows plus a short top row.
-local function ShapeOffsets(w, h, rem, rightAligned)
+-- Cells of a w x h block holding k items: full rows plus one short row, which is
+-- the last row (bottom) unless shortOnTop is set. The top variant matters for
+-- windows whose own short row is on top (Blizzard bags): a cluster that fills
+-- such a window can only be a solid block if its short row is on top as well.
+local function ShapeOffsets(w, h, rem, rightAligned, shortOnTop)
     local offs = {}
+    local shortRow = shortOnTop and 0 or (h - 1)
     for dy = 0, h - 1 do
-        local n  = (dy == h - 1) and rem or w
+        local n  = (dy == shortRow) and rem or w
         local sx = (rightAligned or n == w) and 0 or (w - n)
         for dx = sx, sx + n - 1 do
             offs[#offs + 1] = dx
@@ -234,6 +302,9 @@ end
 --   P = (S - v) + off,  row = floor(P / N) (0 = top),  col = P % N (0 = left)
 -- Valid cells are lo <= P < hi where lo = off and hi = S + off. The last slot
 -- (v = S) is P = off, the first cell of the top row, and packing starts there.
+-- (That is the single-window numbering. The default Blizzard UI numbers a bag the
+-- other way round, P = (v - 1) + off, so slot 1 is the first cell of the top row;
+-- every window carries its own P <-> slot mapping, see BuildMoves.)
 -- Grow a connected region of up to k free cells around `seed`, always adding the
 -- frontier cell closest to the seed. Returns the cells (fewer than k if the
 -- pocket of free cells is too small).
@@ -313,7 +384,7 @@ local function FillFree(owner, lo, hi, N, k)
     return cells, pieces
 end
 
-local function LayoutOnce(clusters, lo, hi, N, reserved, WASTE_WEIGHT)
+local function LayoutOnce(clusters, lo, hi, N, reserved, WASTE_WEIGHT, mirror)
     local stats = { pure = 0, flood = 0 }
     local rows = hi / N
     local owner = {}
@@ -333,8 +404,10 @@ local function LayoutOnce(clusters, lo, hi, N, reserved, WASTE_WEIGHT)
                 local cost   = aspect + WASTE_WEIGHT * waste / k
                 local rem    = k - (h - 1) * w
 
-                for variant = 1, (rem == w) and 1 or 2 do
-                    local offs = ShapeOffsets(w, h, rem, variant == 1)
+                -- variants: 1/2 = short row at the bottom, right/left aligned (the
+                -- original two); 3/4 = the same with the short row on top.
+                for variant = 1, (rem == w) and 1 or (mirror and 4 or 2) do
+                    local offs = ShapeOffsets(w, h, rem, variant % 2 == 1, variant > 2)
                     for y0 = 0, rows - h do
                         local score = cost + EXTEND_WEIGHT * math.max(0, y0 + h - usedRows)
                         if not best or score <= best.score + EPS then
@@ -386,10 +459,10 @@ end
 
 -- Try progressively stricter waste weights until every cluster is a solid block
 -- (or keep the least bad attempt).
-local function LayoutClusters(clusters, lo, hi, N, reserved)
+local function LayoutClusters(clusters, lo, hi, N, reserved, mirror)
     local bestCells, bestStats
     for _, weight in ipairs(WASTE_WEIGHTS) do
-        local cells, st = LayoutOnce(clusters, lo, hi, N, reserved, weight)
+        local cells, st = LayoutOnce(clusters, lo, hi, N, reserved, weight, mirror)
         if not bestStats or st.pure < bestStats.pure
            or (st.pure == bestStats.pure and st.flood < bestStats.flood) then
             bestCells, bestStats = cells, st
@@ -399,20 +472,168 @@ local function LayoutClusters(clusters, lo, hi, N, reserved)
     return bestCells, bestStats
 end
 
+-- Largest part first inside a window (the same order BuildClusters uses).
+local function PartOrder(a, b)
+    if a.size ~= b.size then return a.size > b.size end
+    return a.key < b.key
+end
+
+-- Lay a window out with one more part in it (or none) and report how badly it
+-- goes: 1000 per cluster that had to be cut into pieces, 1 per cluster that was
+-- merely not a solid block.
+local function Trial(g, part)
+    local list = {}
+    for i, p in ipairs(g.parts) do list[i] = p end
+    if part then list[#list + 1] = part end
+    table.sort(list, PartOrder)
+    local _, st = LayoutClusters(list, g.off, g.size + g.off, g.cols, g.reserved, g.mirror)
+    return st.pure * 1000 + st.flood
+end
+
+-- Choose the window for a part that has to go in whole: the first window where
+-- it still lays out as a solid block next to what is already there, otherwise
+-- the window where it hurts least. Free slots alone are not enough - a window can
+-- have room for 4 items and still have no 4-cell block left. Returns the window
+-- index and that window's badness with the part in it, or nil if no window has
+-- room.
+local function ChooseWindow(grids, part)
+    local pick, pickBad, pickWorse
+    for gi, g in ipairs(grids) do
+        if g.free >= part.size then
+            local bad = Trial(g, part)
+            local worse = bad - g.bad
+            if worse <= 0 then return gi, bad end
+            if not pickWorse or worse < pickWorse then pick, pickBad, pickWorse = gi, bad, worse end
+        end
+    end
+    return pick, pickBad
+end
+
+-- Hand every cluster to a window. Clusters arrive largest first. A cluster that
+-- fits whole in some window goes there (see ChooseWindow). One that fits in no
+-- window is split: the roomiest windows are filled up first, until what is left
+-- fits whole somewhere, and that last piece is placed like any other cluster.
+-- Only sizes decide, never where the items currently are, so re-running on an
+-- arranged set of bags changes nothing. Each grid ends up with a list of parts
+-- { key, members, size }. When a cluster is split, members that already sit in
+-- the window a part was given to are kept there (fewer moves).
+local function DistributeClusters(clusters, grids, gridOf)
+    for _, g in ipairs(grids) do g.bad = 0 end
+
+    -- A cluster only counts as "fits whole" if it fits the largest bag, not
+    -- counting the main bank (which is bigger than any bag). Anything larger is
+    -- always broken up over several bags.
+    local maxWhole = 0
+    for _, g in ipairs(grids) do
+        if not g.main and g.size > maxWhole then maxWhole = g.size end
+    end
+    if maxWhole == 0 then maxWhole = math.huge end
+
+    for _, c in ipairs(clusters) do
+        local whole = { key = c.key, members = c.members, size = c.size }
+        local gi, bad
+        if c.size <= maxWhole then gi, bad = ChooseWindow(grids, whole) end
+        if gi then
+            local g = grids[gi]
+            g.parts[#g.parts + 1] = whole
+            g.free, g.bad = g.free - c.size, bad
+        else
+            local left, quota = c.size, {}
+            while left > 0 do
+                local roomiest
+                for i, g in ipairs(grids) do
+                    -- byOrder: take windows strictly in fill order (the main bank,
+                    -- being the biggest window, must not jump the queue).
+                    if g.free > 0 and (not roomiest or (not grids.byOrder and g.free > grids[roomiest].free)) then
+                        roomiest = i
+                    end
+                end
+                if not roomiest then break end   -- cannot happen: items never outnumber slots
+                local target, take = roomiest, grids[roomiest].free
+                if take >= left then
+                    take = left
+                    target = ChooseWindow(grids, { key = c.key .. "#rest", size = left })
+                end
+                quota[target] = (quota[target] or 0) + take
+                grids[target].free = grids[target].free - take
+                left = left - take
+            end
+
+            local used = {}
+            for i = 1, #grids do if quota[i] then used[#used + 1] = i end end
+            local lists, rest = {}, {}
+            for _, i in ipairs(used) do lists[i] = {} end
+            for _, m in ipairs(c.members) do
+                local i = gridOf[m]
+                if lists[i] and #lists[i] < quota[i] then
+                    lists[i][#lists[i] + 1] = m
+                else
+                    rest[#rest + 1] = m
+                end
+            end
+            local r = 1
+            for _, i in ipairs(used) do
+                local l, g = lists[i], grids[i]
+                while #l < quota[i] do l[#l + 1] = rest[r]; r = r + 1 end
+                g.parts[#g.parts + 1] = { key = c.key .. "#" .. i, members = l, size = quota[i] }
+            end
+            for _, i in ipairs(used) do grids[i].bad = Trial(grids[i]) end
+        end
+    end
+
+    for _, g in ipairs(grids) do table.sort(g.parts, PartOrder) end
+end
+
 -- Returns an ordered list of swaps {a, b, preA, preB, postA, postB} (slot indices).
-local function BuildMoves(S, items, N, pinHearthstone)
-    -- The hearthstone owns the last slot (slot S, grid cell p = 0, bottom-right).
-    local hsV
+-- `layout` is a list of grids (see SingleWindowLayout / SeparateWindowsLayout),
+-- or just a column count, meaning one combined window of that width.
+local function BuildMoves(S, items, layout, pinHearthstone)
+    if type(layout) == "number" then layout = SingleWindowLayout(S, layout) end
+
+    -- Per-window geometry. P is the padded grid index described above GrowRegion,
+    -- local to the window; toV turns a cell back into a slot index of the list.
+    -- The order of `grids` is the order windows are filled in. With
+    -- layout.fillFromEnd the list is reversed: the last bag is filled first.
+    local grids, gridOf = {}, {}
+    local nGrids = #layout
+    grids.byOrder = layout.fillFromEnd
+    for li, l in ipairs(layout) do
+        local gi = layout.fillFromEnd and (nGrids - li + 1) or li
+        local off = (l.cols - l.size % l.cols) % l.cols   -- phantom cells in the short top row
+        local first, size = l.first, l.size
+        grids[gi] = {
+            cols = l.cols, size = size, off = off, parts = {}, mirror = l.mirror, main = l.main,
+            free = size,                                  -- capacity left for clusters
+            toV  = l.flip and function(P) return first + size + off - 1 - P end
+                          or  function(P) return first + P - off end,
+        }
+        for v = first, first + size - 1 do gridOf[v] = gi end
+    end
+
+    -- The hearthstone owns the first cell of the top row of the first window
+    -- (single mode: slot S, bottom-right numbering; default mode: slot 1 of the last bag).
+    local hsV, pinV
     if pinHearthstone then
         for v = 1, S do
             if items[v] and items[v].id == HEARTHSTONE_ID then hsV = v; break end
         end
+        if hsV then
+            local pg = grids[1]   -- the window filled first (the last bag when fillFromEnd)
+            pinV = pg.toV(pg.off)
+            pg.free = pg.free - 1
+            pg.reserved = pg.off
+        end
     end
 
     local clusters = BuildClusters(items, S, hsV)
-    local off = (N - S % N) % N       -- phantom cells in the short top row
-    local function toV(P) return S + off - P end
-    local cellsOf, stats = LayoutClusters(clusters, off, S + off, N, hsV and off or nil)
+    DistributeClusters(clusters, grids, gridOf)
+
+    local stats = { pure = 0, flood = 0 }
+    for gi, g in ipairs(grids) do
+        local cellsOf, st = LayoutClusters(g.parts, g.off, g.size + g.off, g.cols, g.reserved, g.mirror)
+        stats.pure, stats.flood = stats.pure + st.pure, stats.flood + st.flood
+        for pi, part in ipairs(g.parts) do part.cells, part.toV = cellsOf[pi], g.toV end
+    end
 
     -- Tokens are the original slot indices of the items.
     local dest, want, itemAt, loc, idOf, sig = {}, {}, {}, {}, {}, {}
@@ -424,23 +645,26 @@ local function BuildMoves(S, items, N, pinHearthstone)
     end
 
     -- Assign items to cells; anything already inside its cluster's area stays.
-    for ci, c in ipairs(clusters) do
-        local isCell = {}
-        for _, P in ipairs(cellsOf[ci]) do isCell[toV(P)] = true end
+    for _, g in ipairs(grids) do
+        for _, part in ipairs(g.parts) do
+            local toV = part.toV
+            local isCell = {}
+            for _, P in ipairs(part.cells) do isCell[toV(P)] = true end
 
-        local movers = {}
-        for _, m in ipairs(c.members) do
-            if isCell[m] then dest[m] = m; isCell[m] = nil
-            else movers[#movers + 1] = m end
+            local movers = {}
+            for _, m in ipairs(part.members) do
+                if isCell[m] then dest[m] = m; isCell[m] = nil
+                else movers[#movers + 1] = m end
+            end
+            local free = {}
+            for _, P in ipairs(part.cells) do
+                local v = toV(P)
+                if isCell[v] then free[#free + 1] = v end
+            end
+            for i, m in ipairs(movers) do dest[m] = free[i] end
         end
-        local free = {}
-        for _, P in ipairs(cellsOf[ci]) do
-            local v = toV(P)
-            if isCell[v] then free[#free + 1] = v end
-        end
-        for i, m in ipairs(movers) do dest[m] = free[i] end
     end
-    if hsV then dest[hsV] = S end
+    if hsV then dest[hsV] = pinV end
     for tok, d in pairs(dest) do want[d] = tok end
 
     -- Turn the permutation into swaps. A slot, once correct, is never touched
@@ -546,12 +770,12 @@ local function Start(mode)
     if job then return Print("already running (/aom stop to cancel).") end
     if CursorHasItem() then return Print("empty your cursor first.") end
 
-    local api, slots, items, N, pin, check, label
+    local api, slots, items, groups, layout, pin, check, label, shape
+    local separate = (GetUI() == "default")
     if mode == "bank" then
         if not IsBankOpen() then return Print("open your bank first.") end
         api, label = BagAPI, "bank"
-        slots, items = ScanBags(BankBagIds())
-        N = math.min(GetColumns(), math.max(#slots, 1))
+        slots, items, groups = ScanBags(BankBagIds())
         check = function() if not IsBankOpen() then return "the bank was closed." end end
     elseif mode == "gbank" then
         if not IsGuildBankOpen() then return Print("open your guild bank first.") end
@@ -562,29 +786,41 @@ local function Start(mode)
         if not canDeposit then Print("warning: you may lack deposit rights on this tab; moves can fail.") end
         api, label = GuildAPI, "guild bank tab " .. tab .. (name and (" (" .. name .. ")") or "")
         slots, items = ScanGuildTab(tab)
-        N = GBANK_COLUMN_H
+        separate = false   -- the guild bank is one Blizzard window either way
+        layout = SingleWindowLayout(#slots, GBANK_COLUMN_H)
+        shape = GBANK_COLUMN_H .. " columns"
         check = function()
             if not IsGuildBankOpen() then return "the guild bank was closed." end
             if GetCurrentGuildBankTab() ~= tab then return "the guild bank tab changed." end
         end
     else
         api, label, pin = BagAPI, "bags", true
-        slots, items = ScanBags(InventoryBagIds())
-        N = math.min(GetColumns(), math.max(#slots, 1))
+        slots, items, groups = ScanBags(InventoryBagIds())
     end
 
     local S = #slots
     if S == 0 then return Print("no usable slots found.") end
     if next(items) == nil then return Print("nothing to arrange.") end
 
-    local moves, nClusters, stats = BuildMoves(S, items, N, pin)
+    if not layout then   -- bags and bank
+        if separate then
+            layout = SeparateWindowsLayout(groups, true)
+            shape = #layout .. " bag windows"
+        else
+            local N = math.min(GetColumns(), math.max(S, 1))
+            layout = SingleWindowLayout(S, N)
+            shape = N .. " columns"
+        end
+    end
+
+    local moves, nClusters, stats = BuildMoves(S, items, layout, pin)
     local split = stats.pure + stats.flood
     if split > 0 then
         Print(string.format("note: not enough free room to keep %d cluster(s) as solid blocks.", split))
     end
     if #moves == 0 then return Print(label .. " already arranged.") end
 
-    Print(string.format("%s: %d slots, %d columns, %d clusters, %d moves...", label, S, N, nClusters, #moves))
+    Print(string.format("%s: %d slots, %s, %d clusters, %d moves...", label, S, shape, nClusters, #moves))
     job = { api = api, slots = slots, moves = moves, check = check,
             idx = 1, phase = "issue", acc = 0, waited = 0 }
     frame:SetScript("OnUpdate", Step)
@@ -605,6 +841,7 @@ frame:SetScript("OnEvent", function(self, event, name)
             ArrangeOMaticDB = ArrangeOMaticDB or {}
             ArrangeOMaticDB.columns = tonumber(ArrangeOMaticDB.columns) or DEFAULT_COLUMNS
             if ArrangeOMaticDB.subtypes == nil then ArrangeOMaticDB.subtypes = true end
+            if ArrangeOMaticDB.ui ~= "single" then ArrangeOMaticDB.ui = "default" end
         end
     elseif event == "BANKFRAME_OPENED" then bankOpen = true
     elseif event == "BANKFRAME_CLOSED" then bankOpen = false
@@ -633,6 +870,19 @@ SlashCmdList["ARRANGEOMATIC"] = function(msg)
             end
             ArrangeOMaticDB.columns = math.floor(n)
             Print("columns set to " .. ArrangeOMaticDB.columns)
+            if GetUI() == "default" then
+                Print("(not used while ui is 'default': Blizzard's windows have a fixed width. /aom ui single to use it)")
+            end
+        end
+    elseif cmd == "ui" or cmd == "layout" then
+        if arg == "default" or arg == "blizzard" or arg == "separate" then
+            ArrangeOMaticDB.ui = "default"
+            Print("ui = default: arranging each bag as its own Blizzard window.")
+        elseif arg == "single" or arg == "combined" or arg == "one" or arg == "addon" then
+            ArrangeOMaticDB.ui = "single"
+            Print("ui = single: arranging all bags as one combined window (" .. GetColumns() .. " columns).")
+        else
+            Print("ui = " .. GetUI() .. "  (use /aom ui single|default)")
         end
     elseif cmd == "groups" or cmd == "group" then
         if arg == "type" or arg == "types" then
@@ -648,6 +898,6 @@ SlashCmdList["ARRANGEOMATIC"] = function(msg)
     elseif cmd == "stop" then
         if job then Abort("cancelled.") else Print("nothing running.") end
     else
-        Print("/aom  |  /aom bank  |  /aom gbank  |  /aom columns <n>  |  /aom groups type|subtype  |  /aom stop")
+        Print("/aom  |  /aom bank  |  /aom gbank  |  /aom ui single|default  |  /aom columns <n>  |  /aom groups type|subtype  |  /aom stop")
     end
 end
