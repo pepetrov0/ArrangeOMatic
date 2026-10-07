@@ -11,6 +11,7 @@ ArrangeOMatic - WotLK 3.3.5a
   /aom columns          show the current value
   /aom groups subtype   group single items by type AND subtype (default)
   /aom groups type      group single items by broad type only
+  /aom pack on|off      combine partial stacks of the same item first (default on)
   /aom stop             cancel a running arrangement
   (long form: /arrangeomatic)
 
@@ -51,6 +52,10 @@ Model
     for /aom gbank the grid "width" is fixed at 7 (one model row = one window
     column, drawn transposed, which keeps clusters square in the window). The
     columns setting does not apply to it.
+  * Packing (on by default): before arranging, partial stacks of the same item
+    are combined - the fullest stack is topped up from the emptiest ones - so at
+    most one partial stack per item is left. Each merge is a normal pick-up and
+    drop onto the other stack, verified like any other move.
   * Clusters:
       - every itemID that occupies 2+ slots is one cluster
       - all remaining single-stack items are grouped into one cluster per
@@ -121,8 +126,16 @@ local function GetCategory(link)
     return itemType .. "/" .. (subType or "")
 end
 
+local function LinkBase(link)
+    return link:match("|H(item:[^|]+)|h") or link
+end
+
+local function SigFrom(base, count)
+    return base .. "x" .. (count or 1)
+end
+
 local function MakeSig(link, count)
-    return (link:match("|H(item:[^|]+)|h") or link) .. "x" .. (count or 1)
+    return SigFrom(LinkBase(link), count)
 end
 
 -- Each container type gets a tiny API so the executor doesn't care which it is.
@@ -152,10 +165,14 @@ end
 local function Describe(api, slot)
     local link = api.link(slot)
     if not link then return nil end
+    local count = api.info(slot)
     return {
-        id  = tonumber(link:match("item:(%d+)")),
-        cat = GetCategory(link),
-        sig = MakeSig(link, (api.info(slot))),
+        id    = tonumber(link:match("item:(%d+)")),
+        cat   = GetCategory(link),
+        sig   = MakeSig(link, count),
+        base  = LinkBase(link),
+        count = count or 1,
+        stack = select(8, GetItemInfo(link)),   -- max stack size (nil if not cached)
     }
 end
 
@@ -584,6 +601,69 @@ local function DistributeClusters(clusters, grids, gridOf)
     for _, g in ipairs(grids) do table.sort(g.parts, PartOrder) end
 end
 
+-- Packing: combine partial stacks of the same item so that at most one partial
+-- stack per item is left. Returns an ordered list of moves in the same format as
+-- BuildMoves ({a, b, preA, preB, postA, postB}): stack `a` is dropped onto stack
+-- `b`, which tops `b` up (and leaves the remainder, if any, in `a`).
+-- `items` is updated in place to the state after all merges, so BuildMoves can
+-- then arrange what is left.
+local function BuildMerges(items, S)
+    local byId = {}
+    for v = 1, S do
+        local it = items[v]
+        if it and it.stack and it.stack > 1 and it.count and it.count < it.stack then
+            local l = byId[it.id]
+            if not l then l = {}; byId[it.id] = l end
+            l[#l + 1] = { v = v, n = it.count }
+        end
+    end
+
+    local ids = {}
+    for id, l in pairs(byId) do
+        if #l > 1 then ids[#ids + 1] = id end
+    end
+    table.sort(ids)
+
+    local moves = {}
+    for _, id in ipairs(ids) do
+        local P = byId[id]
+        table.sort(P, function(a, b)
+            if a.n ~= b.n then return a.n > b.n end
+            return a.v < b.v
+        end)
+        local stack = items[P[1].v].stack
+        -- Fill the fullest stack from the emptiest one, then the next, and so on.
+        local i, j = 1, #P
+        while i < j do
+            local dest, src = P[i], P[j]
+            local dIt, sIt = items[dest.v], items[src.v]
+            local amt = math.min(src.n, stack - dest.n)
+            dest.n, src.n = dest.n + amt, src.n - amt
+
+            local postA = (src.n > 0) and SigFrom(sIt.base, src.n) or ""
+            local postB = SigFrom(dIt.base, dest.n)
+            moves[#moves + 1] = {
+                a = src.v, b = dest.v,
+                preA = sIt.sig, preB = dIt.sig,
+                postA = postA, postB = postB,
+            }
+
+            items[dest.v] = { id = dIt.id, cat = dIt.cat, base = dIt.base,
+                              count = dest.n, stack = dIt.stack, sig = postB }
+            if src.n > 0 then
+                items[src.v] = { id = sIt.id, cat = sIt.cat, base = sIt.base,
+                                 count = src.n, stack = sIt.stack, sig = postA }
+            else
+                items[src.v] = nil
+            end
+
+            if dest.n >= stack then i = i + 1 end
+            if src.n == 0 then j = j - 1 end
+        end
+    end
+    return moves
+end
+
 -- Returns an ordered list of swaps {a, b, preA, preB, postA, postB} (slot indices).
 -- `layout` is a list of grids (see SingleWindowLayout / SeparateWindowsLayout),
 -- or just a column count, meaning one combined window of that width.
@@ -696,7 +776,7 @@ local function BuildMoves(S, items, layout, pinHearthstone)
     return moves, #clusters, stats
 end
 
-ArrangeOMatic = { BuildMoves = BuildMoves, weights = WASTE_WEIGHTS }  -- exposed for debugging/testing
+ArrangeOMatic = { BuildMoves = BuildMoves, BuildMerges = BuildMerges, weights = WASTE_WEIGHTS }  -- exposed for debugging/testing
 
 ---------------------------------------------------------------------------
 -- Execution
@@ -813,14 +893,24 @@ local function Start(mode)
         end
     end
 
+    -- Pack first (combine partial stacks), then arrange what is left.
+    local merges = {}
+    if ArrangeOMaticDB and ArrangeOMaticDB.pack ~= false then
+        merges = BuildMerges(items, S)
+    end
+
     local moves, nClusters, stats = BuildMoves(S, items, layout, pin)
     local split = stats.pure + stats.flood
     if split > 0 then
         Print(string.format("note: not enough free room to keep %d cluster(s) as solid blocks.", split))
     end
+    local nMerges = #merges
+    for i = 1, #moves do merges[#merges + 1] = moves[i] end
+    moves = merges
     if #moves == 0 then return Print(label .. " already arranged.") end
 
-    Print(string.format("%s: %d slots, %s, %d clusters, %d moves...", label, S, shape, nClusters, #moves))
+    Print(string.format("%s: %d slots, %s, %d clusters, %d moves (%d stack merges)...",
+                        label, S, shape, nClusters, #moves, nMerges))
     job = { api = api, slots = slots, moves = moves, check = check,
             idx = 1, phase = "issue", acc = 0, waited = 0 }
     frame:SetScript("OnUpdate", Step)
@@ -841,6 +931,7 @@ frame:SetScript("OnEvent", function(self, event, name)
             ArrangeOMaticDB = ArrangeOMaticDB or {}
             ArrangeOMaticDB.columns = tonumber(ArrangeOMaticDB.columns) or DEFAULT_COLUMNS
             if ArrangeOMaticDB.subtypes == nil then ArrangeOMaticDB.subtypes = true end
+            if ArrangeOMaticDB.pack == nil then ArrangeOMaticDB.pack = true end
             if ArrangeOMaticDB.ui ~= "single" then ArrangeOMaticDB.ui = "default" end
         end
     elseif event == "BANKFRAME_OPENED" then bankOpen = true
@@ -895,9 +986,19 @@ SlashCmdList["ARRANGEOMATIC"] = function(msg)
             Print("groups = " .. (ArrangeOMaticDB.subtypes == false and "type" or "subtype")
                   .. "  (use /aom groups type|subtype)")
         end
+    elseif cmd == "pack" or cmd == "merge" or cmd == "stacks" then
+        if arg == "on" or arg == "1" or arg == "yes" then
+            ArrangeOMaticDB.pack = true
+            Print("pack = on: partial stacks are combined before arranging.")
+        elseif arg == "off" or arg == "0" or arg == "no" then
+            ArrangeOMaticDB.pack = false
+            Print("pack = off: stacks are left as they are.")
+        else
+            Print("pack = " .. (ArrangeOMaticDB.pack == false and "off" or "on") .. "  (use /aom pack on|off)")
+        end
     elseif cmd == "stop" then
         if job then Abort("cancelled.") else Print("nothing running.") end
     else
-        Print("/aom  |  /aom bank  |  /aom gbank  |  /aom ui single|default  |  /aom columns <n>  |  /aom groups type|subtype  |  /aom stop")
+        Print("/aom  |  /aom bank  |  /aom gbank  |  /aom ui single|default  |  /aom columns <n>  |  /aom groups type|subtype  |  /aom pack on|off  |  /aom stop")
     end
 end
